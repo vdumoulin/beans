@@ -40,6 +40,12 @@ If the data download and validation finish successfully, you'll see a `Validatio
 
 Note: We verified that this setup works with SoX v14.4.2 on Ubuntu 20.04.6 LTS, torch==1.12.1, and torchaudio==0.12.1. If you encounter any validation issues, please check your software versions.
 
+## Installation (Perch-compatible)
+
+```
+conda deactivate; conda env remove -n beans-3.10; conda create -n beans-3.10 python=3.10 pytorch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 pytorch-cuda=12.1 -c pytorch -c nvidia; conda activate beans-3.10; cd $HOME/beans; pip install -r requirements.txt; pip install -e .; pip install git+https://github.com/google-research/perch-hoplite.git; conda install conda-forge::tensorflow-gpu==2.16.1 conda-forge::tensorflow-hub
+```
+
 ## Running the benchmark
 
 You can run all the baseline models by running:

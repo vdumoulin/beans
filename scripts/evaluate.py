@@ -6,12 +6,15 @@ import random
 import sys
 import yaml
 
+import numpy as np
 from sklearn import preprocessing
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.svm import SVC
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.multioutput import MultiOutputClassifier
+import tensorflow as tf
+import tensorflow_hub as hub
 import torch
 import torch.optim as optim
 import torch.nn.functional as F
@@ -22,6 +25,9 @@ from xgboost import XGBClassifier
 from beans.metrics import Accuracy, MeanAveragePrecision
 from beans.models import ResNetClassifier, VGGishClassifier
 from beans.datasets import ClassificationDataset, RecognitionDataset
+from perch_hoplite.zoo.taxonomy_model_tf import TaxonomyModelTF
+
+tf.experimental.numpy.experimental_enable_numpy_behavior()
 
 
 def read_datasets(path):
@@ -40,18 +46,30 @@ def spec2feats(spec):
     return spec.numpy().reshape(-1)
 
 
-def eval_sklearn_model(model_and_scaler, dataloader, num_labels, metric_factory):
+def eval_sklearn_model(model_and_scaler, dataloader, num_labels, metric_factory,
+                       embedding_fn):
     total_loss = 0.
     metric = metric_factory()
     model, scaler = model_and_scaler
 
     for x, y in dataloader:
-        xs = [spec2feats(x[i]) for i in range(x.shape[0])]
+        if embedding_fn is not None:
+            xs = list(
+                embedding_fn.batch_embed(x).pooled_embeddings(
+                    time_pooling='mean', channel_pooling='squeeze'
+                )
+            )
+        else:
+            xs = [spec2feats(x[i]) for i in range(x.shape[0])]
         xs_scaled = scaler.transform(xs)
-        pred = model.predict(xs_scaled)
+        # Detection task requires scores rather than predicted classes.
         if isinstance(model, MultiOutputClassifier):
+            pred = np.stack(
+                [y[:, 1] for y in model.predict_proba(xs_scaled)], axis=1
+            )
             pred = torch.tensor(pred)
         else:
+            pred = model.predict(xs_scaled)
             pred = F.one_hot(torch.tensor(pred), num_classes=num_labels)
         metric.update(pred, y)
 
@@ -63,8 +81,21 @@ def train_sklearn_model(args, dataloader_train, dataloader_valid, num_labels, me
 
     xs = []
     ys = []
+
+    embedding_fn = (
+        TaxonomyModelTF.load_version(8) if args.embed_with_perch else None
+    )
     for x, y in dataloader_train:
-        xs.extend(spec2feats(x[i]) for i in range(x.shape[0]))
+        if embedding_fn is not None:
+            xs.extend(
+                list(
+                    embedding_fn.batch_embed(x).pooled_embeddings(
+                        time_pooling='mean', channel_pooling='squeeze'
+                    )
+                )
+            )
+        else:
+            xs.extend(spec2feats(x[i]) for i in range(x.shape[0]))
         ys.extend(y[i].numpy() for i in range(y.shape[0]))
 
     scaler = preprocessing.StandardScaler().fit(xs)
@@ -84,7 +115,7 @@ def train_sklearn_model(args, dataloader_train, dataloader_valid, num_labels, me
         print(f'Fitting data (params: {extra_params})...', file=sys.stderr)
 
         if args.model_type == 'lr':
-            model = LogisticRegression(max_iter=1_000, **extra_params)
+            model = LogisticRegression(max_iter=10_000, **extra_params)
         elif args.model_type == 'svm':
             model = SVC(**extra_params)
         elif args.model_type == 'decisiontree':
@@ -103,7 +134,8 @@ def train_sklearn_model(args, dataloader_train, dataloader_valid, num_labels, me
             model_and_scaler=(model, scaler),
             dataloader=dataloader_valid,
             num_labels=num_labels,
-            metric_factory=metric_factory)
+            metric_factory=metric_factory,
+            embedding_fn=embedding_fn)
 
         if valid_metric > valid_metric_best:
             best_model = model
@@ -113,9 +145,9 @@ def train_sklearn_model(args, dataloader_train, dataloader_valid, num_labels, me
             'extra_params': extra_params,
             'valid': {
                 'metric': valid_metric
-            }}, file=log_file)
+            }}, file=log_file, flush=True)
 
-    return (best_model, scaler), valid_metric_best
+    return (best_model, scaler), valid_metric_best, embedding_fn
 
 
 def eval_pytorch_model(model, dataloader, metric_factory, device, desc):
@@ -247,6 +279,7 @@ def main():
         'resnet50', 'resnet50-pretrained',
         'resnet152', 'resnet152-pretrained',
         'vggish'])
+    parser.add_argument('--embed-with-perch', action='store_true')
     parser.add_argument('--dataset', choices=datasets.keys())
     parser.add_argument('--num-workers', type=int, default=4)
     parser.add_argument('--stop-shuffle', action='store_true')
@@ -262,10 +295,17 @@ def main():
 
     device = torch.device('cuda:0')
 
+    if args.embed_with_perch and args.model_type not in (
+        'lr', 'svm', 'decisiontree', 'gbdt', 'xgboost'
+    ):
+        raise ValueError('--embed-with-perch only supports sklearn model types')
+
     if args.model_type == 'vggish':
         feature_type = 'vggish'
     elif args.model_type.startswith('resnet'):
         feature_type = 'melspectrogram'
+    elif args.embed_with_perch:
+        feature_type = 'waveform'
     else:
         feature_type = 'mfcc'
 
@@ -363,7 +403,7 @@ def main():
         Metric = MeanAveragePrecision
 
     if args.model_type in {'lr', 'svm', 'decisiontree', 'gbdt', 'xgboost'}:
-        model_and_scaler, valid_metric_best = train_sklearn_model(
+        model_and_scaler, valid_metric_best, embedding_fn = train_sklearn_model(
             args=args,
             dataloader_train=dataloader_train,
             dataloader_valid=dataloader_valid,
@@ -376,7 +416,8 @@ def main():
                 model_and_scaler=model_and_scaler,
                 dataloader=dataloader_test,
                 num_labels=num_labels,
-                metric_factory=Metric)
+                metric_factory=Metric,
+                embedding_fn=embedding_fn)
 
     else:
         model, valid_metric_best = train_pytorch_model(
